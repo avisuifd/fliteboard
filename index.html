@@ -36,16 +36,19 @@
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
     overscroll-behavior: none;
     background: var(--bg);
+    overflow: hidden; /* only #app's <main> scrolls — body itself never does */
   }
-  /* iOS Safari's address bar showing/hiding changes the old 100% layout
-     viewport mid-scroll, which used to squash the header/tab bar for a
-     frame. 100dvh tracks the actual visible viewport instead, so the
-     chrome stays a fixed size and only the scrollable content area
-     resizes. Falls back to 100% automatically on anything that doesn't
-     support dvh. */
-  @supports (height: 100dvh) {
-    html, body, #app { height: 100dvh; }
-  }
+  /* #app is pinned with position:fixed + inset:0 rather than a plain
+     height:100% block. A normal block can still drift on some phones —
+     the on-screen keyboard opening, an input's native
+     scroll-into-view, or the address bar collapsing can nudge body-level
+     scroll, which drags a merely-tall element (and its header/tab bar)
+     along with it. Fixed positioning anchors the whole app frame
+     directly to the visual viewport so the header always stays pinned
+     to the top and the tab bar always stays pinned to the bottom,
+     regardless of tab, device, or keyboard state — only the content
+     inside <main> ever moves. */
+  #app { position: fixed; inset: 0; display: flex; flex-direction: column; }
   /* Soft color behind everything — mostly a clear sky blue, like the
      reference: the glass gets its color almost entirely from blurring and
      refracting this, not from tinting itself. */
@@ -71,7 +74,6 @@
     background: radial-gradient(130% 90% at 18% -10%, rgba(255,255,255,0.55), transparent 55%);
     mix-blend-mode: screen;
   }
-  #app { display: flex; flex-direction: column; height: 100%; }
   header {
     margin: calc(8px + var(--safe-top)) 10px 6px;
     padding: 14px 18px;
@@ -424,6 +426,29 @@
     border-top: 1px solid var(--glass-border);
     overflow-x: auto;
   }
+  .pdf-thumb-strip {
+    display: flex; gap: 8px; padding: 8px 12px; overflow-x: auto;
+    background: linear-gradient(180deg, rgba(255,255,255,0.14), rgba(255,255,255,0.05));
+    backdrop-filter: blur(30px) saturate(190%);
+    -webkit-backdrop-filter: blur(30px) saturate(190%);
+    border-top: 1px solid var(--glass-border);
+    -webkit-overflow-scrolling: touch;
+  }
+  .pdf-thumb {
+    flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 4px;
+    background: none; border: none; padding: 0; opacity: 0.55;
+    transition: opacity 0.2s ease, transform 0.15s cubic-bezier(.4,0,.2,1);
+  }
+  .pdf-thumb:active { transform: scale(0.92); }
+  .pdf-thumb.active { opacity: 1; }
+  .pdf-thumb canvas {
+    border-radius: 4px; border: 2px solid transparent; display: block;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    transition: border-color 0.2s ease;
+  }
+  .pdf-thumb.active canvas { border-color: var(--accent); }
+  .pdf-thumb-num { font-size: 10px; color: var(--text-dim); font-weight: 600; }
+  .pdf-thumb.active .pdf-thumb-num { color: var(--accent); }
   .swatch {
     width: 30px; height: 30px; border-radius: 50%; flex: 0 0 auto;
     position: relative;
@@ -1431,7 +1456,12 @@ async function openPdfAnnotator(record, storeName) {
   const toolbar = document.createElement("div");
   toolbar.className = "draw-toolbar";
 
+  const thumbStrip = document.createElement("div");
+  thumbStrip.className = "pdf-thumb-strip";
+  thumbStrip.style.display = "none"; // shown only if the doc has more than one page
+
   wrap.appendChild(holder);
+  wrap.appendChild(thumbStrip);
   wrap.appendChild(toolbar);
 
   // --- shared drawing state (applies across every page in the doc) ---
@@ -1577,6 +1607,7 @@ async function openPdfAnnotator(record, storeName) {
   function buildPage(pageNum) {
     const pageBlock = document.createElement("div");
     pageBlock.className = "pdf-page-block";
+    pageBlock.dataset.pageNum = pageNum;
     const zoomWrap = document.createElement("div");
     zoomWrap.className = "pdf-zoom-wrap";
     const pdfCanvas = document.createElement("canvas");
@@ -1607,23 +1638,32 @@ async function openPdfAnnotator(record, storeName) {
 
     let pageScale = 1; // CSS px per PDF user-space unit, current fit-width render
     let zoomState = record.zoomState[pageNum]
-      ? { scale: 1, rotate: 0, tx: 0, ty: 0, ...record.zoomState[pageNum] }
-      : { scale: 1, rotate: 0, tx: 0, ty: 0 };
+      ? { scale: 1, tx: 0, ty: 0, ...record.zoomState[pageNum] }
+      : { scale: 1, tx: 0, ty: 0 };
     let zoomSaveTimer = null;
 
     function applyZoomTransform() {
-      zoomWrap.style.transform =
-        `translate(${zoomState.tx}px, ${zoomState.ty}px) rotate(${zoomState.rotate}rad) scale(${zoomState.scale})`;
+      zoomWrap.style.transform = `translate(${zoomState.tx}px, ${zoomState.ty}px) scale(${zoomState.scale})`;
       zoomResetBtn.classList.toggle(
         "visible",
-        zoomState.scale > 1.03 || Math.abs(zoomState.rotate) > 0.02 ||
-        Math.abs(zoomState.tx) > 2 || Math.abs(zoomState.ty) > 2
+        zoomState.scale > 1.03 || Math.abs(zoomState.tx) > 2 || Math.abs(zoomState.ty) > 2
       );
     }
     function animatedZoomTransform() {
       zoomWrap.classList.add("animating");
       applyZoomTransform();
       setTimeout(() => zoomWrap.classList.remove("animating"), 320);
+    }
+    // Like a camera zoom, not a movable object: the page itself never
+    // leaves its spot on the stack, it only magnifies in place. Panning
+    // is just how you look around once zoomed in — so once your fingers
+    // lift, the pan is clamped back to the page's own bounds (and to
+    // zero once you're back at 1x) instead of letting the page drift.
+    function clampZoomPan() {
+      const maxPanX = (pageBlock.clientWidth * (zoomState.scale - 1)) / 2;
+      const maxPanY = (pageBlock.clientHeight * (zoomState.scale - 1)) / 2;
+      zoomState.tx = Math.min(maxPanX, Math.max(-maxPanX, zoomState.tx));
+      zoomState.ty = Math.min(maxPanY, Math.max(-maxPanY, zoomState.ty));
     }
     function scheduleZoomSave() {
       clearTimeout(zoomSaveTimer);
@@ -1634,7 +1674,7 @@ async function openPdfAnnotator(record, storeName) {
     }
     zoomResetBtn.addEventListener("click", () => {
       haptic();
-      zoomState = { scale: 1, rotate: 0, tx: 0, ty: 0 };
+      zoomState = { scale: 1, tx: 0, ty: 0 };
       animatedZoomTransform();
       scheduleZoomSave();
     });
@@ -1676,14 +1716,12 @@ async function openPdfAnnotator(record, storeName) {
     }
     pageRenders.push(render);
 
-    // --- pinch-to-zoom + twist-to-rotate + two-finger pan, like iPad Notes.
-    // Rotation pivots around the page's own center (transform-origin: 50% 50%)
-    // rather than trying to keep the exact pinch point pinned during rotation —
-    // a small simplification that still feels natural, since pan is applied
-    // as a direct finger-follow offset on top of it.
+    // --- pinch-to-zoom + two-finger pan — like your phone's camera app:
+    // pinch to magnify in place (anchored under your fingers) and drag
+    // with two fingers to look around while zoomed in. The page itself
+    // never tilts or gets picked up — only the "camera" over it moves.
     let gesture = null;
     function touchDist(a, b) { return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY); }
-    function touchAngle(a, b) { return Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX); }
     function touchMid(a, b) { return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 }; }
 
     inkCanvas.addEventListener("touchstart", (e) => {
@@ -1693,7 +1731,6 @@ async function openPdfAnnotator(record, storeName) {
         activePageNum = pageNum;
         gesture = {
           lastDist: touchDist(e.touches[0], e.touches[1]),
-          lastAngle: touchAngle(e.touches[0], e.touches[1]),
           lastMid: touchMid(e.touches[0], e.touches[1]),
         };
         zoomWrap.classList.add("gesture-active");
@@ -1703,14 +1740,22 @@ async function openPdfAnnotator(record, storeName) {
       if (e.touches.length === 2 && gesture) {
         e.preventDefault();
         const d = touchDist(e.touches[0], e.touches[1]);
-        const a = touchAngle(e.touches[0], e.touches[1]);
         const m = touchMid(e.touches[0], e.touches[1]);
         const scaleFactor = d / gesture.lastDist;
-        zoomState.scale = Math.min(Math.max(zoomState.scale * scaleFactor, 0.5), 6);
-        zoomState.rotate += (a - gesture.lastAngle);
+        const newScale = Math.min(Math.max(zoomState.scale * scaleFactor, 1), 6);
+        // Anchor the zoom under the pinch midpoint, camera-style, so the
+        // spot between your fingers stays put as you magnify it.
+        const pbRect = pageBlock.getBoundingClientRect();
+        const cx = pbRect.left + pbRect.width / 2;
+        const cy = pbRect.top + pbRect.height / 2;
+        const anchorX = (m.x - cx - zoomState.tx) / zoomState.scale;
+        const anchorY = (m.y - cy - zoomState.ty) / zoomState.scale;
+        zoomState.tx = m.x - cx - anchorX * newScale;
+        zoomState.ty = m.y - cy - anchorY * newScale;
+        zoomState.scale = newScale;
         zoomState.tx += m.x - gesture.lastMid.x;
         zoomState.ty += m.y - gesture.lastMid.y;
-        gesture.lastDist = d; gesture.lastAngle = a; gesture.lastMid = m;
+        gesture.lastDist = d; gesture.lastMid = m;
         applyZoomTransform();
       }
     }, { passive: false });
@@ -1718,6 +1763,8 @@ async function openPdfAnnotator(record, storeName) {
       if (e.touches.length < 2 && gesture) {
         gesture = null;
         zoomWrap.classList.remove("gesture-active");
+        clampZoomPan();
+        animatedZoomTransform();
         scheduleZoomSave();
         haptic(6);
       }
@@ -1729,20 +1776,16 @@ async function openPdfAnnotator(record, storeName) {
     const lctx = liveCanvas.getContext("2d");
 
     function screenToPdf(e) {
-      // Maps a screen touch point back to PDF-space coordinates, correctly
-      // accounting for this page's current pan/rotate/zoom — inverts the
-      // CSS transform (translate, then rotate+scale around the page's
-      // center) so drawing stays pinned to the page content at any
-      // zoom/rotation, not just when the page is at rest.
+      // Maps a screen touch point back to PDF-space coordinates, inverting
+      // this page's current pan/zoom (no rotation to account for — the
+      // page itself never tilts) so drawing stays pinned to the page
+      // content at any zoom level, not just when at rest.
       const t = e.touches ? e.touches[0] : e;
       const pbRect = pageBlock.getBoundingClientRect();
       const cx = pbRect.left + pbRect.width / 2;
       const cy = pbRect.top + pbRect.height / 2;
-      let vx = (t.clientX - zoomState.tx - cx) / zoomState.scale;
-      let vy = (t.clientY - zoomState.ty - cy) / zoomState.scale;
-      const cos = Math.cos(zoomState.rotate), sin = Math.sin(zoomState.rotate);
-      const ux = vx * cos + vy * sin;
-      const uy = -vx * sin + vy * cos;
+      const ux = (t.clientX - zoomState.tx - cx) / zoomState.scale;
+      const uy = (t.clientY - zoomState.ty - cy) / zoomState.scale;
       const localX = pbRect.width / 2 + ux;
       const localY = pbRect.height / 2 + uy;
       return { x: localX / pageScale, y: localY / pageScale };
@@ -1800,11 +1843,70 @@ async function openPdfAnnotator(record, storeName) {
     inkCanvas.addEventListener("touchstart", (e) => { if (e.touches.length > 1) return; start(e); }, { passive: false });
     inkCanvas.addEventListener("touchmove", (e) => { if (e.touches.length > 1) { drawing = false; return; } move(e); }, { passive: false });
     inkCanvas.addEventListener("touchend", end);
+    return pageBlock;
   }
 
-  for (let n = 1; n <= numPages; n++) buildPage(n);
+  const pageBlockEls = [];
+  for (let n = 1; n <= numPages; n++) pageBlockEls.push(buildPage(n));
 
   window.addEventListener("resize", () => pageRenders.forEach((r) => r()));
+
+  // --- page thumbnail strip (only worth showing for multi-page docs) ---
+  if (numPages > 1) {
+    thumbStrip.style.display = "flex";
+    const thumbEls = [];
+
+    pdfDoc.getPage(1).then(async (firstPage) => {
+      const base = firstPage.getViewport({ scale: 1 });
+      const thumbHeight = 52;
+      const thumbScale = thumbHeight / base.height;
+
+      for (let n = 1; n <= numPages; n++) {
+        const page = await pdfDoc.getPage(n);
+        const viewport = page.getViewport({ scale: thumbScale });
+        const dpr = window.devicePixelRatio || 1;
+
+        const btn = document.createElement("button");
+        btn.className = "pdf-thumb";
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.floor(viewport.width * dpr);
+        canvas.height = Math.floor(viewport.height * dpr);
+        canvas.style.width = viewport.width + "px";
+        canvas.style.height = viewport.height + "px";
+        const ctx = canvas.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        await page.render({ canvasContext: ctx, viewport }).promise;
+
+        const numLabel = document.createElement("div");
+        numLabel.className = "pdf-thumb-num";
+        numLabel.textContent = n;
+
+        btn.appendChild(canvas);
+        btn.appendChild(numLabel);
+        btn.addEventListener("click", () => {
+          haptic();
+          pageBlockEls[n - 1].scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+        thumbStrip.appendChild(btn);
+        thumbEls.push(btn);
+      }
+
+      // Highlight whichever page is currently most visible as you scroll.
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting && entry.intersectionRatio > 0.5) {
+              const n = parseInt(entry.target.dataset.pageNum, 10);
+              thumbEls.forEach((el, i) => el.classList.toggle("active", i === n - 1));
+              thumbEls[n - 1]?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+            }
+          });
+        },
+        { root: holder, threshold: [0.5] }
+      );
+      pageBlockEls.forEach((el) => observer.observe(el));
+    });
+  }
 
   openFullScreen(escapeHtml(record.title || record.name || "Document"), wrap, () => {});
   requestAnimationFrame(() => pageRenders.forEach((r) => r()));
